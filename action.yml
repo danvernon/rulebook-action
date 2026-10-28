@@ -1,0 +1,104 @@
+name: Rulebook
+description: Test whether coding agents follow your repo's written rules (AGENTS.md, CLAUDE.md, .cursor/rules).
+branding:
+  icon: check-square
+  color: blue
+
+inputs:
+  agents:
+    description: Comma-separated agents to test (claude-code, codex). Codex also needs OPENAI_API_KEY in env.
+    required: false
+    default: claude-code
+  runs:
+    description: Repeats per task, agent and condition.
+    required: false
+    default: "2"
+  api-url:
+    description: Rulebook dashboard URL. Leave empty for the hosted dashboard.
+    required: false
+    default: ""
+  token:
+    description: Dashboard upload token. When empty, nothing leaves the runner.
+    required: false
+    default: ""
+  fail-on-regression:
+    description: Fail the job when a rule regressed against .rulebook/baseline.json.
+    required: false
+    default: "false"
+  version:
+    description: rulebook-ai npm version to run.
+    required: false
+    default: latest
+
+outputs:
+  report-dir:
+    description: Directory holding report.json, report.md and report.html.
+    value: ${{ steps.report.outputs.dir }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+
+    - name: Check rules
+      shell: bash
+      env:
+        RULEBOOK_AGENTS: ${{ inputs.agents }}
+        RULEBOOK_RUNS: ${{ inputs.runs }}
+        RULEBOOK_VERSION: ${{ inputs.version }}
+      run: npx --yes "rulebook-ai@${RULEBOOK_VERSION}" check --yes --json --agents "$RULEBOOK_AGENTS" --runs "$RULEBOOK_RUNS"
+
+    - name: Find report
+      id: report
+      if: always()
+      shell: bash
+      run: |
+        dir=$(ls -1d .rulebook/runs/*/ 2>/dev/null | sort | tail -n 1)
+        echo "dir=${dir%/}" >> "$GITHUB_OUTPUT"
+        if [ -n "$dir" ] && [ -f "${dir}report.md" ]; then
+          cat "${dir}report.md" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Save runs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: rulebook-runs
+        path: .rulebook/runs
+        if-no-files-found: ignore
+
+    - name: Upload report
+      if: inputs.token != ''
+      shell: bash
+      env:
+        RULEBOOK_TOKEN: ${{ inputs.token }}
+        RULEBOOK_API_URL: ${{ inputs.api-url }}
+        RULEBOOK_VERSION: ${{ inputs.version }}
+        REPORT_DIR: ${{ steps.report.outputs.dir }}
+      run: |
+        url=$(npx --yes "rulebook-ai@${RULEBOOK_VERSION}" upload "$REPORT_DIR" | head -n 1)
+        echo "Dashboard: $url"
+        printf '\n[Open in Rulebook](%s)\n' "$url" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Check drift
+      shell: bash
+      env:
+        RULEBOOK_VERSION: ${{ inputs.version }}
+        FAIL_ON_REGRESSION: ${{ inputs.fail-on-regression }}
+        REPORT_DIR: ${{ steps.report.outputs.dir }}
+      run: |
+        if [ ! -f .rulebook/baseline.json ]; then
+          echo "No .rulebook/baseline.json; run 'npx rulebook-ai accept' and commit it to get drift checks."
+          exit 0
+        fi
+        flag=""
+        if [ "$FAIL_ON_REGRESSION" = "true" ]; then flag="--fail-on-regression"; fi
+        set +e
+        npx --yes "rulebook-ai@${RULEBOOK_VERSION}" drift --head "$REPORT_DIR" $flag > "$RUNNER_TEMP/rulebook-drift.md"
+        code=$?
+        set -e
+        cat "$RUNNER_TEMP/rulebook-drift.md"
+        cat "$RUNNER_TEMP/rulebook-drift.md" >> "$GITHUB_STEP_SUMMARY"
+        exit $code
